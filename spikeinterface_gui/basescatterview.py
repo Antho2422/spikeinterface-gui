@@ -18,16 +18,42 @@ class BaseScatterView(ViewBase):
     
     def __init__(self, spike_data, y_label, controller=None, parent=None, backend="qt"):
         
+        # Handle case where spike_data is None
+        if spike_data is None:
+            raise ValueError(
+                f"spike_data is None. Make sure the required extension is computed in the SortingAnalyzer. "
+                f"For SpikeDepthView, you need: sorting_analyzer.compute('spike_locations', method='monopolar_triangulation')"
+            )
+        
         # compute data bounds
         assert len(spike_data) == len(controller.spikes), "spike_data must have the same length as spikes"
         assert spike_data.ndim == 1, "spike_data must be 1D"
         self.spike_data = spike_data
         self.y_label = y_label
 
-        self._data_min = np.min(spike_data)
-        self._data_max = np.max(spike_data)
-        eps = (self._data_max - self._data_min) / 100.0
-        self._data_max += eps
+        # Handle edge cases with NaN values or empty arrays
+        if spike_data.size == 0:
+            self._data_min = 0.0
+            self._data_max = 1.0
+        else:
+            # Filter out NaN values for computing min/max
+            valid_data = spike_data[~np.isnan(spike_data)]
+            if valid_data.size == 0:
+                # All values are NaN
+                self._data_min = 0.0
+                self._data_max = 1.0
+            else:
+                self._data_min = np.min(valid_data)
+                self._data_max = np.max(valid_data)
+                # Handle case where all values are the same
+                if self._data_min == self._data_max:
+                    eps = max(abs(self._data_min) * 0.1, 1.0)
+                    self._data_min -= eps
+                    self._data_max += eps
+                else:
+                    eps = (self._data_max - self._data_min) / 100.0
+                    self._data_max += eps
+        
         self._max_count = None
 
         ViewBase.__init__(self, controller=controller, parent=parent,  backend=backend)
@@ -37,10 +63,25 @@ class BaseScatterView(ViewBase):
         inds = self.controller.get_spike_indices(unit_id, seg_index=seg_index)
         spike_times = self.controller.spikes["sample_index"][inds] / self.controller.sampling_frequency
         spike_data = self.spike_data[inds]
-        ptp = np.ptp(spike_data)
-        hist_min, hist_max = [np.min(spike_data) - 0.2 * ptp, np.max(spike_data) + 0.2 * ptp]
-
-        hist_count, hist_bins = np.histogram(spike_data, bins=np.linspace(hist_min, hist_max, self.settings['num_bins']))
+        
+        # Handle NaN values in spike_data for histogram calculation
+        valid_mask = ~np.isnan(spike_data)
+        valid_spike_data = spike_data[valid_mask]
+        
+        if valid_spike_data.size == 0:
+            # All values are NaN, create empty histogram
+            hist_count = np.zeros(self.settings['num_bins'])
+            hist_bins = np.linspace(0, 1, self.settings['num_bins'] + 1)
+        else:
+            ptp = np.ptp(valid_spike_data)
+            if ptp == 0:
+                # All valid values are the same
+                center = valid_spike_data[0]
+                hist_min, hist_max = center - 0.5, center + 0.5
+            else:
+                hist_min, hist_max = [np.min(valid_spike_data) - 0.2 * ptp, np.max(valid_spike_data) + 0.2 * ptp]
+            
+            hist_count, hist_bins = np.histogram(valid_spike_data, bins=np.linspace(hist_min, hist_max, self.settings['num_bins']))
 
         if self.settings['auto_decimate'] and spike_times.size > self.settings['max_spikes_per_unit']:
             step = spike_times.size // self.settings['max_spikes_per_unit']
@@ -58,6 +99,13 @@ class BaseScatterView(ViewBase):
         selected_spikes = spikes_in_seg[mask]
         spike_times = selected_spikes['sample_index'] / self.controller.sampling_frequency
         spike_data = self.spike_data[sl][mask]
+        
+        # Filter out NaN values
+        if len(spike_data) > 0:
+            valid_mask = ~np.isnan(spike_data)
+            spike_times = spike_times[valid_mask]
+            spike_data = spike_data[valid_mask]
+        
         return (spike_times, spike_data)
 
 
@@ -150,10 +198,16 @@ class BaseScatterView(ViewBase):
 
             spike_times, spike_data, hist_count, hist_bins, _ = self.get_unit_data(unit_id)
 
-            # make a copy of the color
-            color = QT.QColor(self.get_unit_color(unit_id))
-            color.setAlpha(int(self.settings['alpha']*255))
-            self.scatter.addPoints(x=spike_times, y=spike_data,  pen=pg.mkPen(None), brush=color)
+            # Filter out NaN values for plotting
+            valid_mask = ~np.isnan(spike_data)
+            if np.any(valid_mask):
+                valid_spike_times = spike_times[valid_mask]
+                valid_spike_data = spike_data[valid_mask]
+                
+                # make a copy of the color
+                color = QT.QColor(self.get_unit_color(unit_id))
+                color.setAlpha(int(self.settings['alpha']*255))
+                self.scatter.addPoints(x=valid_spike_times, y=valid_spike_data,  pen=pg.mkPen(None), brush=color)
 
             color = self.get_unit_color(unit_id)
             curve = pg.PlotCurveItem(hist_count, hist_bins[:-1], fillLevel=None, fillOutline=True, brush=color, pen=color)
@@ -169,6 +223,11 @@ class BaseScatterView(ViewBase):
         self.plot2.setXRange(0, self._max_count, padding = 0.0)
         
         spike_times, spike_data = self.get_selected_spikes_data()
+        # Filter out NaN values for selected spikes
+        if len(spike_data) > 0:
+            valid_mask = ~np.isnan(spike_data)
+            spike_times = spike_times[valid_mask]
+            spike_data = spike_data[valid_mask]
         self.scatter_select.setData(spike_times, spike_data)
 
     def enable_disable_lasso(self, checked):
@@ -209,7 +268,19 @@ class BaseScatterView(ViewBase):
         spike_times = visible_spikes['sample_index'] / fs
         spike_data = self.spike_data[sl][visible_mask]
         
-        points = np.column_stack((spike_times, spike_data))
+        # Filter out NaN values for lasso selection
+        valid_mask = ~np.isnan(spike_data)
+        if not np.any(valid_mask):
+            # All values are NaN, clear selection
+            self.controller.set_indices_spike_selected([])
+            self.refresh()
+            self.notify_spike_selection_changed()
+            return
+        
+        valid_spike_times = spike_times[valid_mask]
+        valid_spike_data = spike_data[valid_mask]
+        
+        points = np.column_stack((valid_spike_times, valid_spike_data))
         inside = mpl_path(vertices).contains_points(points)
         
         # Clear selection if no spikes inside lasso
@@ -219,9 +290,10 @@ class BaseScatterView(ViewBase):
             self.notify_spike_selection_changed()
             return
 
-        # Map back to original indices
+        # Map back to original indices using valid_mask
         visible_indices = np.nonzero(visible_mask)[0]
-        selected_indices = sl.start + visible_indices[inside]
+        valid_visible_indices = visible_indices[valid_mask]
+        selected_indices = sl.start + valid_visible_indices[inside]
         self.controller.set_indices_spike_selected(selected_indices)
         self.refresh()
         self.notify_spike_selection_changed()
@@ -331,12 +403,21 @@ class BaseScatterView(ViewBase):
                 unit_id,
                 seg_index=self.segment_index
             )
-            color = self.get_unit_color(unit_id)
-            xs.extend(spike_times)
-            ys.extend(spike_data)
-            colors.extend([color] * len(spike_times))
+            
+            # Filter out NaN values for plotting
+            valid_mask = ~np.isnan(spike_data)
+            if np.any(valid_mask):
+                valid_spike_times = spike_times[valid_mask]
+                valid_spike_data = spike_data[valid_mask]
+                valid_inds = inds[valid_mask] if len(inds) == len(spike_data) else inds
+                
+                color = self.get_unit_color(unit_id)
+                xs.extend(valid_spike_times)
+                ys.extend(valid_spike_data)
+                colors.extend([color] * len(valid_spike_times))
+                self.plotted_inds.extend(valid_inds)
+            
             max_count = max(max_count, np.max(hist_count))
-            self.plotted_inds.extend(inds)
 
             hist_lines = self.hist_fig.line(
                 "x",
@@ -346,7 +427,7 @@ class BaseScatterView(ViewBase):
                      "y":hist_bins[:-1],
                      }
                 ),
-                line_color=color,
+                line_color=self.get_unit_color(unit_id),
                 line_width=2,
             )
             self.hist_lines.append(hist_lines)

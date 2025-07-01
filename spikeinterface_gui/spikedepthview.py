@@ -7,6 +7,7 @@ class SpikeDepthView(BaseScatterView):
     def __init__(self, controller=None, parent=None, backend="qt"):
         y_label = "Depth (um)"
         spike_data = controller.spike_depths
+        
         BaseScatterView.__init__(
             self,
             controller=controller,
